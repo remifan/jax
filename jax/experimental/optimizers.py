@@ -90,7 +90,7 @@ import jax.numpy as jnp
 from jax._src.util import partial, safe_zip, safe_map, unzip2
 from jax import tree_util
 from jax.tree_util import (tree_map, tree_flatten, tree_unflatten,
-                           register_pytree_node)
+                           tree_multimap, register_pytree_node)
 
 map = safe_map
 zip = safe_zip
@@ -126,12 +126,31 @@ class Optimizer(NamedTuple):
   update_fn: UpdateFn
   params_fn: ParamsFn
 
+def _iscomplex(x):
+    return issubclass(x.dtype.type, jnp.complexfloating)
+def _cx2flt(c):
+    # convert a complex-valued tree to a pair of real-valued trees
+    return tree_multimap(lambda *xs: tuple(xs), *tree_map(lambda x: (x.real, x.imag), c))
+def _flt2cx(f):
+    return tree_multimap(lambda a, b: a + 1j * b, *f)
+def complex_as_realtuple(update_fn):
+    def f(i, grad, state):
+        if _iscomplex(grad):
+            gr, gi = _cx2flt(grad)
+            sr, si = _cx2flt(state)
+            new_state = _flt2cx((update_fn(i, gr, sr), update_fn(i, -gi, si)))
+        else:
+            new_state = update_fn(i, grad, state)
+        return new_state
+    return f
+
 Schedule = Callable[[Step], float]
 
 def optimizer(opt_maker: Callable[...,
   Tuple[Callable[[Params], State],
         Callable[[Step, Updates, Params], Params],
-        Callable[[State], Params]]]) -> Callable[..., Optimizer]:
+        Callable[[State], Params]]],
+  complex_handler: Callable=complex_as_realtuple) -> Callable[..., Optimizer]:
   """Decorator to make an optimizer defined for arrays generalize to containers.
 
   With this decorator, you can write init, update, and get_params functions that
@@ -185,7 +204,7 @@ def optimizer(opt_maker: Callable[...,
                "initialized: parameter tree {} and grad tree {}.")
         raise TypeError(msg.format(tree, tree2))
       states = map(tree_unflatten, subtrees, states_flat)
-      new_states = map(partial(update, i), grad_flat, states)
+      new_states = map(partial(complex_handler(update), i), grad_flat, states)
       new_states_flat, subtrees2 = unzip2(map(tree_flatten, new_states))
       for subtree, subtree2 in zip(subtrees, subtrees2):
         if subtree2 != subtree:
